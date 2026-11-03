@@ -71,6 +71,40 @@ extern "C" {
         out_has_crc: *mut i32,
         out_is_dir: *mut i32,
     ) -> i32;
+
+    fn oz_set_password(pw_utf16le: *const u8, pw_byte_len: usize);
+    fn oz_7zaes_encrypt_cbc(
+        num_cycles: u32,
+        salt: *const u8,
+        salt_len: usize,
+        iv: *const u8,
+        pw_utf16le: *const u8,
+        pw_len: usize,
+        data: *mut u8,
+        data_size: usize,
+    );
+    fn oz_aes_ctr_le_crypt(
+        key: *const u8,
+        key_len: usize,
+        data: *mut u8,
+        data_len: usize,
+    );
+}
+
+pub fn set_global_password(password: Option<&str>) {
+    if let Some(pw) = password {
+        let mut utf16_bytes = Vec::with_capacity(pw.len() * 2);
+        for u in pw.encode_utf16() {
+            utf16_bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        unsafe {
+            oz_set_password(utf16_bytes.as_ptr(), utf16_bytes.len());
+        }
+    } else {
+        unsafe {
+            oz_set_password(std::ptr::null(), 0);
+        }
+    }
 }
 
 pub const FILTER_NONE: u8 = 0;
@@ -815,6 +849,92 @@ pub fn write_standard_archive(
     entries: &[FileEntry],
     folders: &[SevenZipFolderOut],
 ) -> std::io::Result<u64> {
+    write_standard_archive_with_password(archive_path, entries, folders, None)
+}
+
+fn encode_filter_coder(hdr: &mut Vec<u8>, filter_id: u8) {
+    match filter_id {
+        FILTER_BCJ_X86 => {
+            hdr.push(0x04); // idSize = 4, no props
+            hdr.extend_from_slice(&[0x03, 0x03, 0x01, 0x03]); // k_BCJ
+        }
+        FILTER_BCJ_ARM64 => {
+            hdr.push(0x01); // idSize = 1, no props
+            hdr.push(0x0A); // k_ARM64
+        }
+        FILTER_DELTA_1 | FILTER_DELTA_2 | FILTER_DELTA_4 => {
+            let d_prop = match filter_id {
+                FILTER_DELTA_1 => 0u8,
+                FILTER_DELTA_2 => 1u8,
+                _ => 3u8,
+            };
+            hdr.push(0x21); // hasProps (0x20) | idSize=1
+            hdr.push(0x03); // k_Delta
+            write_varint(hdr, 1);
+            hdr.push(d_prop);
+        }
+        _ => unreachable!(),
+    }
+}
+
+pub fn write_standard_archive_with_password(
+    archive_path: &Path,
+    entries: &[FileEntry],
+    folders: &[SevenZipFolderOut],
+    password: Option<&str>,
+) -> std::io::Result<u64> {
+    let pw_opt = password.filter(|s| !s.is_empty());
+
+    // Prepare encrypted pack streams and 26-byte 7zAES properties if password is set
+    let mut encrypted_packs: Vec<Vec<u8>> = Vec::new();
+    let mut aes_props = [0u8; 26];
+    if let Some(pw) = pw_opt {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0x1234_5678_9ABC_DEF0);
+        let mut seed_buf = Vec::with_capacity(64);
+        seed_buf.extend_from_slice(&nanos.to_le_bytes());
+        seed_buf.extend_from_slice(archive_path.to_string_lossy().as_bytes());
+        let seed_hash = sha256_fast(&seed_buf);
+        let mut salt = [0u8; 8];
+        let mut iv = [0u8; 16];
+        salt.copy_from_slice(&seed_hash[0..8]);
+        iv.copy_from_slice(&seed_hash[8..24]);
+
+        // 7zAES properties:
+        // b0 = 0xC0 | 19 (salt present + IV present + numCyclesPower=19)
+        // b1 = (7 << 4) | 15 (salt_len = 8, iv_len = 16)
+        aes_props[0] = 0xC0 | 19;
+        aes_props[1] = (7 << 4) | 15;
+        aes_props[2..10].copy_from_slice(&salt);
+        aes_props[10..26].copy_from_slice(&iv);
+
+        let mut pw_utf16 = Vec::with_capacity(pw.len() * 2);
+        for u in pw.encode_utf16() {
+            pw_utf16.extend_from_slice(&u.to_le_bytes());
+        }
+
+        for fo in folders {
+            let padded_len = (fo.pack_data.len() + 15) & !15;
+            let mut enc = vec![0u8; padded_len.max(16)];
+            enc[..fo.pack_data.len()].copy_from_slice(&fo.pack_data);
+            unsafe {
+                oz_7zaes_encrypt_cbc(
+                    19,
+                    salt.as_ptr(),
+                    salt.len(),
+                    iv.as_ptr(),
+                    pw_utf16.as_ptr(),
+                    pw_utf16.len(),
+                    enc.as_mut_ptr(),
+                    enc.len(),
+                );
+            }
+            encrypted_packs.push(enc);
+        }
+    }
+
     let mut hdr = Vec::with_capacity(65536);
     hdr.push(NID_HEADER);
 
@@ -826,8 +946,13 @@ pub fn write_standard_archive(
         write_varint(&mut hdr, 0); // dataOffset = 0 (starts right after 32-byte signature header)
         write_varint(&mut hdr, folders.len() as u64);
         hdr.push(NID_SIZE);
-        for fo in folders {
-            write_varint(&mut hdr, fo.pack_data.len() as u64);
+        for (idx, fo) in folders.iter().enumerate() {
+            let plen = if pw_opt.is_some() {
+                encrypted_packs[idx].len()
+            } else {
+                fo.pack_data.len()
+            };
+            write_varint(&mut hdr, plen as u64);
         }
         hdr.push(NID_END);
 
@@ -837,49 +962,68 @@ pub fn write_standard_archive(
         write_varint(&mut hdr, folders.len() as u64);
         hdr.push(0); // external = 0
         for fo in folders {
-            if fo.filter_id == FILTER_NONE {
-                write_varint(&mut hdr, 1); // numCoders = 1
-                hdr.push(0x21); // hasProps (0x20) | idSize=1 (0x01)
-                hdr.push(0x21); // k_LZMA2
-                write_varint(&mut hdr, 1); // propsSize = 1
-                hdr.push(fo.lzma2_prop);
-            } else {
-                write_varint(&mut hdr, 2); // numCoders = 2 (Coder 0 = LZMA2, Coder 1 = Filter)
-                // Coder 0: LZMA2
-                hdr.push(0x21);
-                hdr.push(0x21);
-                write_varint(&mut hdr, 1);
-                hdr.push(fo.lzma2_prop);
-                // Coder 1: Filter
-                match fo.filter_id {
-                    FILTER_BCJ_X86 => {
-                        hdr.push(0x04); // idSize = 4, no props
-                        hdr.extend_from_slice(&[0x03, 0x03, 0x01, 0x03]); // k_BCJ
-                    }
-                    FILTER_BCJ_ARM64 => {
-                        hdr.push(0x01); // idSize = 1, no props
-                        hdr.push(0x0A); // k_ARM64
-                    }
-                    FILTER_DELTA_1 | FILTER_DELTA_2 | FILTER_DELTA_4 => {
-                        let d_prop = match fo.filter_id {
-                            FILTER_DELTA_1 => 0u8,
-                            FILTER_DELTA_2 => 1u8,
-                            _ => 3u8,
-                        };
-                        hdr.push(0x21); // hasProps (0x20) | idSize=1
-                        hdr.push(0x03); // k_Delta
-                        write_varint(&mut hdr, 1);
-                        hdr.push(d_prop);
-                    }
-                    _ => unreachable!(),
+            match (pw_opt.is_some(), fo.filter_id != FILTER_NONE) {
+                (false, false) => {
+                    write_varint(&mut hdr, 1); // numCoders = 1
+                    hdr.push(0x21); // hasProps (0x20) | idSize=1 (0x01)
+                    hdr.push(0x21); // k_LZMA2
+                    write_varint(&mut hdr, 1); // propsSize = 1
+                    hdr.push(fo.lzma2_prop);
                 }
-                // 1 Bond connecting Coder 0 output (OutIndex=0) to Coder 1 input (InIndex=1)
-                write_varint(&mut hdr, 1); // InIndex = 1
-                write_varint(&mut hdr, 0); // OutIndex = 0
+                (false, true) => {
+                    write_varint(&mut hdr, 2); // Coder 0 = LZMA2, Coder 1 = Filter
+                    hdr.push(0x21);
+                    hdr.push(0x21);
+                    write_varint(&mut hdr, 1);
+                    hdr.push(fo.lzma2_prop);
+                    encode_filter_coder(&mut hdr, fo.filter_id);
+                    write_varint(&mut hdr, 1); // InIndex = 1
+                    write_varint(&mut hdr, 0); // OutIndex = 0
+                }
+                (true, false) => {
+                    write_varint(&mut hdr, 2); // Coder 0 = 7zAES, Coder 1 = LZMA2
+                    // Coder 0: 7zAES (0x06F10701)
+                    hdr.push(0x24); // hasProps (0x20) | idSize=4
+                    hdr.extend_from_slice(&[0x06, 0xF1, 0x07, 0x01]);
+                    write_varint(&mut hdr, 26);
+                    hdr.extend_from_slice(&aes_props);
+                    // Coder 1: LZMA2
+                    hdr.push(0x21);
+                    hdr.push(0x21);
+                    write_varint(&mut hdr, 1);
+                    hdr.push(fo.lzma2_prop);
+                    // Bond: Coder 0 output (OutIndex=0) -> Coder 1 input (InIndex=1)
+                    write_varint(&mut hdr, 1);
+                    write_varint(&mut hdr, 0);
+                }
+                (true, true) => {
+                    write_varint(&mut hdr, 3); // Coder 0 = 7zAES, Coder 1 = LZMA2, Coder 2 = Filter
+                    // Coder 0: 7zAES
+                    hdr.push(0x24);
+                    hdr.extend_from_slice(&[0x06, 0xF1, 0x07, 0x01]);
+                    write_varint(&mut hdr, 26);
+                    hdr.extend_from_slice(&aes_props);
+                    // Coder 1: LZMA2
+                    hdr.push(0x21);
+                    hdr.push(0x21);
+                    write_varint(&mut hdr, 1);
+                    hdr.push(fo.lzma2_prop);
+                    // Coder 2: Filter
+                    encode_filter_coder(&mut hdr, fo.filter_id);
+                    // Bond 0: Coder 0 output (0) -> Coder 1 input (1)
+                    write_varint(&mut hdr, 1);
+                    write_varint(&mut hdr, 0);
+                    // Bond 1: Coder 1 output (1) -> Coder 2 input (2)
+                    write_varint(&mut hdr, 2);
+                    write_varint(&mut hdr, 1);
+                }
             }
         }
         hdr.push(NID_CODERS_UNPACK_SIZE);
         for fo in folders {
+            if pw_opt.is_some() {
+                write_varint(&mut hdr, fo.pack_data.len() as u64);
+            }
             write_varint(&mut hdr, fo.unpack_size as u64);
             if fo.filter_id != FILTER_NONE {
                 write_varint(&mut hdr, fo.unpack_size as u64);
@@ -955,7 +1099,11 @@ pub fn write_standard_archive(
 
     hdr.push(NID_END); // End Header
 
-    let next_header_offset: u64 = folders.iter().map(|fo| fo.pack_data.len() as u64).sum();
+    let next_header_offset: u64 = if pw_opt.is_some() {
+        encrypted_packs.iter().map(|p| p.len() as u64).sum()
+    } else {
+        folders.iter().map(|fo| fo.pack_data.len() as u64).sum()
+    };
     let next_header_size = hdr.len() as u64;
     let next_header_crc = crc32_fast(&hdr);
 
@@ -972,8 +1120,14 @@ pub fn write_standard_archive(
 
     let mut f = File::create(archive_path)?;
     f.write_all(&start_hdr)?;
-    for fo in folders {
-        f.write_all(&fo.pack_data)?;
+    if pw_opt.is_some() {
+        for p in &encrypted_packs {
+            f.write_all(p)?;
+        }
+    } else {
+        for fo in folders {
+            f.write_all(&fo.pack_data)?;
+        }
     }
     f.write_all(&hdr)?;
 
@@ -1240,6 +1394,1348 @@ pub fn read_and_decompress_archive(
     Ok((files_meta, folder_buffers))
 }
 
+/* ---------- Multi-Format Support: RFC 1951 DEFLATE, ZipCrypto, WinZip AES, .zip, .tar, .tar.gz, .gz ---------- */
+
+pub mod multi_format {
+    use super::*;
+
+    /* --- 1. SHA-1 + HMAC-SHA1 + PBKDF2-HMAC-SHA1 (for WinZip AES-128/192/256 0x9901) --- */
+
+    pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
+        let mut h0: u32 = 0x6745_2301;
+        let mut h1: u32 = 0xEFCD_AB89;
+        let mut h2: u32 = 0x98BA_DCFE;
+        let mut h3: u32 = 0x1032_5476;
+        let mut h4: u32 = 0xC3D2_E1F0;
+
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        let mut msg = Vec::with_capacity((data.len() + 72) & !63);
+        msg.extend_from_slice(data);
+        msg.push(0x80);
+        while (msg.len() % 64) != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        let mut w = [0u32; 80];
+        for chunk in msg.chunks_exact(64) {
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    chunk[i * 4],
+                    chunk[i * 4 + 1],
+                    chunk[i * 4 + 2],
+                    chunk[i * 4 + 3],
+                ]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+
+            let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+            for i in 0..80 {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1u32),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6u32),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(w[i]);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h0 = h0.wrapping_add(a);
+            h1 = h1.wrapping_add(b);
+            h2 = h2.wrapping_add(c);
+            h3 = h3.wrapping_add(d);
+            h4 = h4.wrapping_add(e);
+        }
+
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&h0.to_be_bytes());
+        out[4..8].copy_from_slice(&h1.to_be_bytes());
+        out[8..12].copy_from_slice(&h2.to_be_bytes());
+        out[12..16].copy_from_slice(&h3.to_be_bytes());
+        out[16..20].copy_from_slice(&h4.to_be_bytes());
+        out
+    }
+
+    pub fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+        let mut k_block = [0u8; 64];
+        if key.len() > 64 {
+            let hashed = sha1_digest(key);
+            k_block[..20].copy_from_slice(&hashed);
+        } else {
+            k_block[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5Cu8; 64];
+        for i in 0..64 {
+            ipad[i] ^= k_block[i];
+            opad[i] ^= k_block[i];
+        }
+        let mut inner = Vec::with_capacity(64 + message.len());
+        inner.extend_from_slice(&ipad);
+        inner.extend_from_slice(message);
+        let inner_hash = sha1_digest(&inner);
+
+        let mut outer = [0u8; 84];
+        outer[..64].copy_from_slice(&opad);
+        outer[64..84].copy_from_slice(&inner_hash);
+        sha1_digest(&outer)
+    }
+
+    pub fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], iterations: u32, out_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(out_len);
+        let mut block_idx = 1u32;
+        while out.len() < out_len {
+            let mut salt_blk = Vec::with_capacity(salt.len() + 4);
+            salt_blk.extend_from_slice(salt);
+            salt_blk.extend_from_slice(&block_idx.to_be_bytes());
+            let mut u = hmac_sha1(password, &salt_blk);
+            let mut t = u;
+            for _ in 1..iterations {
+                u = hmac_sha1(password, &u);
+                for j in 0..20 {
+                    t[j] ^= u[j];
+                }
+            }
+            let take = (out_len - out.len()).min(20);
+            out.extend_from_slice(&t[..take]);
+            block_idx += 1;
+        }
+        out
+    }
+
+    /* --- 2. Traditional PKWARE ZipCrypto Stream Cipher --- */
+
+    pub struct ZipCryptoKeys {
+        k0: u32,
+        k1: u32,
+        k2: u32,
+    }
+
+    impl ZipCryptoKeys {
+        #[inline]
+        fn crc32_byte(crc: u32, b: u8) -> u32 {
+            let mut c = crc ^ (b as u32);
+            for _ in 0..8 {
+                if (c & 1) != 0 {
+                    c = (c >> 1) ^ 0xEDB8_8320;
+                } else {
+                    c >>= 1;
+                }
+            }
+            c
+        }
+
+        pub fn new(password: &[u8]) -> Self {
+            let mut s = Self {
+                k0: 0x1234_5678,
+                k1: 0x2345_6789,
+                k2: 0x3456_7890,
+            };
+            for &b in password {
+                s.update(b);
+            }
+            s
+        }
+
+        #[inline]
+        pub fn update(&mut self, b: u8) {
+            self.k0 = Self::crc32_byte(self.k0, b);
+            self.k1 = (self.k1.wrapping_add(self.k0 & 0xFF))
+                .wrapping_mul(134_775_813)
+                .wrapping_add(1);
+            self.k2 = Self::crc32_byte(self.k2, (self.k1 >> 24) as u8);
+        }
+
+        #[inline]
+        pub fn stream_byte(&self) -> u8 {
+            let temp = (self.k2 as u16) | 2;
+            (((temp.wrapping_mul(temp ^ 1)) >> 8) & 0xFF) as u8
+        }
+
+        #[inline]
+        pub fn decrypt_byte(&mut self, c: u8) -> u8 {
+            let p = c ^ self.stream_byte();
+            self.update(p);
+            p
+        }
+
+        #[inline]
+        pub fn encrypt_byte(&mut self, p: u8) -> u8 {
+            let c = p ^ self.stream_byte();
+            self.update(p);
+            c
+        }
+    }
+
+    /* --- 3. RFC 1951 DEFLATE Decompressor (inflate_raw) & Compressor (deflate_compress) --- */
+
+    struct BitReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        bit_buf: u64,
+        bit_cnt: u32,
+    }
+
+    impl<'a> BitReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self {
+                data,
+                pos: 0,
+                bit_buf: 0,
+                bit_cnt: 0,
+            }
+        }
+
+        #[inline]
+        fn refill(&mut self) {
+            while self.bit_cnt <= 56 && self.pos < self.data.len() {
+                self.bit_buf |= (self.data[self.pos] as u64) << self.bit_cnt;
+                self.pos += 1;
+                self.bit_cnt += 8;
+            }
+        }
+
+        #[inline]
+        fn read_bits(&mut self, n: u32) -> Result<u32, String> {
+            if n == 0 {
+                return Ok(0);
+            }
+            if self.bit_cnt < n {
+                self.refill();
+                if self.bit_cnt < n {
+                    return Err("Unexpected EOF in DEFLATE bitstream".to_string());
+                }
+            }
+            let val = (self.bit_buf & ((1u64 << n) - 1)) as u32;
+            self.bit_buf >>= n;
+            self.bit_cnt -= n;
+            Ok(val)
+        }
+
+        fn align_byte(&mut self) {
+            let rem = self.bit_cnt & 7;
+            if rem > 0 {
+                self.bit_buf >>= rem;
+                self.bit_cnt -= rem;
+            }
+        }
+
+        fn read_u16_aligned(&mut self) -> Result<u16, String> {
+            self.align_byte();
+            let lo = self.read_bits(8)? as u16;
+            let hi = self.read_bits(8)? as u16;
+            Ok(lo | (hi << 8))
+        }
+    }
+
+    #[derive(Clone)]
+    struct HuffTable {
+        counts: [u16; 16],
+        symbols: Vec<u16>,
+    }
+
+    impl HuffTable {
+        fn build(lengths: &[u8]) -> Result<Self, String> {
+            let mut counts = [0u16; 16];
+            for &l in lengths {
+                if l as usize >= 16 {
+                    return Err("Invalid Huffman code length".to_string());
+                }
+                if l > 0 {
+                    counts[l as usize] += 1;
+                }
+            }
+            let mut offsets = [0u16; 16];
+            let mut total = 0u16;
+            for bits in 1..16 {
+                offsets[bits] = total;
+                total += counts[bits];
+            }
+            let mut symbols = vec![0u16; total as usize];
+            for (sym, &l) in lengths.iter().enumerate() {
+                if l > 0 {
+                    let off = offsets[l as usize] as usize;
+                    symbols[off] = sym as u16;
+                    offsets[l as usize] += 1;
+                }
+            }
+            Ok(Self { counts, symbols })
+        }
+
+        #[inline]
+        fn decode(&self, br: &mut BitReader) -> Result<u16, String> {
+            let mut code = 0i32;
+            let mut first = 0i32;
+            let mut index = 0i32;
+            for len in 1..=15 {
+                code |= br.read_bits(1)? as i32;
+                let count = self.counts[len] as i32;
+                if code - count < first {
+                    return Ok(self.symbols[(index + (code - first)) as usize]);
+                }
+                index += count;
+                first += count;
+                first <<= 1;
+                code <<= 1;
+            }
+            Err("Invalid Huffman code in DEFLATE stream".to_string())
+        }
+    }
+
+    pub fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, String> {
+        const LEN_BASE: [u16; 29] = [
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
+            115, 131, 163, 195, 227, 258,
+        ];
+        const LEN_EXTRA: [u8; 29] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+        ];
+        const DIST_BASE: [u16; 30] = [
+            1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+            1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+        ];
+        const DIST_EXTRA: [u8; 30] = [
+            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+            12, 13, 13,
+        ];
+        const CL_ORDER: [usize; 19] = [
+            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+        ];
+
+        let mut br = BitReader::new(data);
+        let mut out = Vec::with_capacity(data.len().saturating_mul(2).max(1024));
+
+        loop {
+            let bfinal = br.read_bits(1)?;
+            let btype = br.read_bits(2)?;
+
+            match btype {
+                0 => {
+                    let len = br.read_u16_aligned()?;
+                    let nlen = br.read_u16_aligned()?;
+                    if (len ^ 0xFFFF) != nlen {
+                        return Err("Corrupt uncompressed block length in DEFLATE".to_string());
+                    }
+                    for _ in 0..len {
+                        out.push(br.read_bits(8)? as u8);
+                    }
+                }
+                1 | 2 => {
+                    let (lit_table, dist_table) = if btype == 1 {
+                        let mut lit_lens = [0u8; 288];
+                        for i in 0..=143 {
+                            lit_lens[i] = 8;
+                        }
+                        for i in 144..=255 {
+                            lit_lens[i] = 9;
+                        }
+                        for i in 256..=279 {
+                            lit_lens[i] = 7;
+                        }
+                        for i in 280..=287 {
+                            lit_lens[i] = 8;
+                        }
+                        let dist_lens = [5u8; 32];
+                        (HuffTable::build(&lit_lens)?, HuffTable::build(&dist_lens)?)
+                    } else {
+                        let hlit = (br.read_bits(5)? as usize) + 257;
+                        let hdist = (br.read_bits(5)? as usize) + 1;
+                        let hclen = (br.read_bits(4)? as usize) + 4;
+                        let mut cl_lens = [0u8; 19];
+                        for i in 0..hclen {
+                            cl_lens[CL_ORDER[i]] = br.read_bits(3)? as u8;
+                        }
+                        let cl_table = HuffTable::build(&cl_lens)?;
+                        let mut lens = Vec::with_capacity(hlit + hdist);
+                        while lens.len() < hlit + hdist {
+                            let sym = cl_table.decode(&mut br)?;
+                            match sym {
+                                0..=15 => lens.push(sym as u8),
+                                16 => {
+                                    let prev = *lens
+                                        .last()
+                                        .ok_or_else(|| "Invalid repeat in DEFLATE header".to_string())?;
+                                    let rep = (br.read_bits(2)? as usize) + 3;
+                                    for _ in 0..rep {
+                                        lens.push(prev);
+                                    }
+                                }
+                                17 => {
+                                    let rep = (br.read_bits(3)? as usize) + 3;
+                                    for _ in 0..rep {
+                                        lens.push(0);
+                                    }
+                                }
+                                18 => {
+                                    let rep = (br.read_bits(7)? as usize) + 11;
+                                    for _ in 0..rep {
+                                        lens.push(0);
+                                    }
+                                }
+                                _ => return Err("Invalid code length symbol".to_string()),
+                            }
+                        }
+                        (
+                            HuffTable::build(&lens[..hlit])?,
+                            HuffTable::build(&lens[hlit..hlit + hdist])?,
+                        )
+                    };
+
+                    loop {
+                        let sym = lit_table.decode(&mut br)?;
+                        if sym < 256 {
+                            out.push(sym as u8);
+                        } else if sym == 256 {
+                            break;
+                        } else {
+                            let l_idx = (sym as usize) - 257;
+                            if l_idx >= LEN_BASE.len() {
+                                return Err("Invalid length symbol in DEFLATE".to_string());
+                            }
+                            let length = (LEN_BASE[l_idx] as usize)
+                                + (br.read_bits(LEN_EXTRA[l_idx] as u32)? as usize);
+                            let d_sym = dist_table.decode(&mut br)? as usize;
+                            if d_sym >= DIST_BASE.len() {
+                                return Err("Invalid distance symbol in DEFLATE".to_string());
+                            }
+                            let dist = (DIST_BASE[d_sym] as usize)
+                                + (br.read_bits(DIST_EXTRA[d_sym] as u32)? as usize);
+                            if dist == 0 || dist > out.len() {
+                                return Err("Distance out of bounds in DEFLATE".to_string());
+                            }
+                            let start = out.len() - dist;
+                            for i in 0..length {
+                                let b = out[start + i];
+                                out.push(b);
+                            }
+                        }
+                    }
+                }
+                _ => return Err("Invalid DEFLATE block type 3".to_string()),
+            }
+
+            if bfinal != 0 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    struct BitWriter {
+        out: Vec<u8>,
+        bit_buf: u64,
+        bit_cnt: u32,
+    }
+
+    impl BitWriter {
+        fn with_capacity(cap: usize) -> Self {
+            Self {
+                out: Vec::with_capacity(cap),
+                bit_buf: 0,
+                bit_cnt: 0,
+            }
+        }
+
+        #[inline]
+        fn write_bits(&mut self, val: u32, n: u32) {
+            self.bit_buf |= ((val as u64) & ((1u64 << n) - 1)) << self.bit_cnt;
+            self.bit_cnt += n;
+            while self.bit_cnt >= 8 {
+                self.out.push((self.bit_buf & 0xFF) as u8);
+                self.bit_buf >>= 8;
+                self.bit_cnt -= 8;
+            }
+        }
+
+        #[inline]
+        fn write_huff_msb(&mut self, code: u16, len: u8) {
+            let mut rev = 0u32;
+            for i in 0..(len as u32) {
+                if (code & (1 << (len as u32 - 1 - i))) != 0 {
+                    rev |= 1 << i;
+                }
+            }
+            self.write_bits(rev, len as u32);
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.bit_cnt > 0 {
+                self.out.push((self.bit_buf & 0xFF) as u8);
+            }
+            self.out
+        }
+    }
+
+    #[inline]
+    fn write_fixed_lit(bw: &mut BitWriter, sym: u16) {
+        match sym {
+            0..=143 => bw.write_huff_msb(0x30 + sym, 8),
+            144..=255 => bw.write_huff_msb(0x190 + (sym - 144), 9),
+            256..=279 => bw.write_huff_msb(sym - 256, 7),
+            _ => bw.write_huff_msb(0xC0 + (sym - 280), 8),
+        }
+    }
+
+    #[inline]
+    fn write_fixed_match(bw: &mut BitWriter, mut len: usize, dist: usize) {
+        const LEN_BASE: [usize; 29] = [
+            3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
+            115, 131, 163, 195, 227, 258,
+        ];
+        const LEN_EXTRA: [u8; 29] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+        ];
+        const DIST_BASE: [usize; 30] = [
+            1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+            1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+        ];
+        const DIST_EXTRA: [u8; 30] = [
+            0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+            12, 13, 13,
+        ];
+        len = len.min(258);
+        let mut l_idx = 0;
+        for i in (0..29).rev() {
+            if len >= LEN_BASE[i] {
+                l_idx = i;
+                break;
+            }
+        }
+        write_fixed_lit(bw, (257 + l_idx) as u16);
+        if LEN_EXTRA[l_idx] > 0 {
+            bw.write_bits((len - LEN_BASE[l_idx]) as u32, LEN_EXTRA[l_idx] as u32);
+        }
+
+        let mut d_idx = 0;
+        for i in (0..30).rev() {
+            if dist >= DIST_BASE[i] {
+                d_idx = i;
+                break;
+            }
+        }
+        bw.write_huff_msb(d_idx as u16, 5);
+        if DIST_EXTRA[d_idx] > 0 {
+            bw.write_bits((dist - DIST_BASE[d_idx]) as u32, DIST_EXTRA[d_idx] as u32);
+        }
+    }
+
+    pub fn deflate_compress(data: &[u8], level: i32) -> Vec<u8> {
+        if level <= 0 || data.is_empty() {
+            let mut out = Vec::with_capacity(data.len() + (data.len() / 65535 + 1) * 5);
+            let mut pos = 0;
+            while pos < data.len() || pos == 0 {
+                let rem = data.len() - pos;
+                let chunk = rem.min(65535);
+                let is_last = pos + chunk >= data.len();
+                out.push(if is_last { 0x01 } else { 0x00 });
+                let l = chunk as u16;
+                let nl = !l;
+                out.extend_from_slice(&l.to_le_bytes());
+                out.extend_from_slice(&nl.to_le_bytes());
+                out.extend_from_slice(&data[pos..pos + chunk]);
+                pos += chunk;
+                if pos >= data.len() {
+                    break;
+                }
+            }
+            return out;
+        }
+
+        let mut bw = BitWriter::with_capacity(data.len() / 2 + 64);
+        bw.write_bits(1, 1); // BFINAL = 1
+        bw.write_bits(1, 2); // BTYPE = 01 (Fixed Huffman)
+
+        const HASH_BITS: usize = 15;
+        const HASH_SIZE: usize = 1 << HASH_BITS;
+        let mut head = vec![u32::MAX; HASH_SIZE];
+        let mut prev = vec![u32::MAX; 32768];
+        let max_chain = if level >= 7 { 64 } else { 16 };
+
+        let hash4 = |p: usize| -> usize {
+            let v = u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
+            ((v.wrapping_mul(0x1E35_A7BD)) >> (32 - HASH_BITS)) as usize
+        };
+
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let mut best_len = 0usize;
+            let mut best_dist = 0usize;
+
+            if pos + 4 <= data.len() {
+                let h = hash4(pos);
+                let mut cur = head[h];
+                head[h] = pos as u32;
+                prev[pos & 0x7FFF] = cur;
+
+                let max_len = (data.len() - pos).min(258);
+                let mut chain = 0;
+                while cur != u32::MAX && chain < max_chain {
+                    let cpos = cur as usize;
+                    let dist = pos - cpos;
+                    if dist > 32768 || dist == 0 {
+                        break;
+                    }
+                    if data[cpos + best_len] == data[pos + best_len]
+                        && data[cpos..cpos + 3] == data[pos..pos + 3]
+                    {
+                        let mut l = 3;
+                        while l < max_len && data[cpos + l] == data[pos + l] {
+                            l += 1;
+                        }
+                        if l > best_len {
+                            best_len = l;
+                            best_dist = dist;
+                            if l == max_len {
+                                break;
+                            }
+                        }
+                    }
+                    cur = prev[cpos & 0x7FFF];
+                    chain += 1;
+                }
+            }
+
+            if best_len >= 4 {
+                write_fixed_match(&mut bw, best_len, best_dist);
+                let end = (pos + best_len).min(data.len().saturating_sub(4));
+                for p in (pos + 1)..=end {
+                    let h = hash4(p);
+                    prev[p & 0x7FFF] = head[h];
+                    head[h] = p as u32;
+                }
+                pos += best_len;
+            } else {
+                write_fixed_lit(&mut bw, data[pos] as u16);
+                pos += 1;
+            }
+        }
+
+        write_fixed_lit(&mut bw, 256); // End of block
+        bw.finish()
+    }
+
+    /* --- 4. Native .zip Archive Reader & Writer (STORE, DEFLATE, ZipCrypto, WinZip AES-128/192/256) --- */
+
+    #[derive(Clone, Debug)]
+    pub struct ZipEntryMeta {
+        pub name: String,
+        pub method: u16,
+        pub flags: u16,
+        pub crc32: u32,
+        pub comp_size: u64,
+        pub uncomp_size: u64,
+        pub local_header_offset: u64,
+        pub mtime: u16,
+        pub is_dir: bool,
+        pub aes_info: Option<(u16, u8, u16)>, // (ae_version, strength 1/2/3, actual_method)
+    }
+
+    fn parse_zip_extra(
+        extra: &[u8],
+        comp_size: &mut u64,
+        uncomp_size: &mut u64,
+        local_offset: &mut u64,
+        aes_info: &mut Option<(u16, u8, u16)>,
+    ) {
+        let mut pos = 0;
+        while pos + 4 <= extra.len() {
+            let tag = u16::from_le_bytes([extra[pos], extra[pos + 1]]);
+            let sz = u16::from_le_bytes([extra[pos + 2], extra[pos + 3]]) as usize;
+            pos += 4;
+            if pos + sz > extra.len() {
+                break;
+            }
+            let body = &extra[pos..pos + sz];
+            if tag == 0x0001 {
+                // ZIP64 Extended Information Extra Field
+                let mut bpos = 0;
+                if *uncomp_size == 0xFFFF_FFFF && bpos + 8 <= body.len() {
+                    *uncomp_size = u64::from_le_bytes(body[bpos..bpos + 8].try_into().unwrap());
+                    bpos += 8;
+                }
+                if *comp_size == 0xFFFF_FFFF && bpos + 8 <= body.len() {
+                    *comp_size = u64::from_le_bytes(body[bpos..bpos + 8].try_into().unwrap());
+                    bpos += 8;
+                }
+                if *local_offset == 0xFFFF_FFFF && bpos + 8 <= body.len() {
+                    *local_offset = u64::from_le_bytes(body[bpos..bpos + 8].try_into().unwrap());
+                }
+            } else if tag == 0x9901 && sz >= 7 {
+                // WinZip AES Extra Field (AE-1 / AE-2)
+                let ae_ver = u16::from_le_bytes([body[0], body[1]]);
+                let strength = body[4];
+                let actual_method = u16::from_le_bytes([body[5], body[6]]);
+                *aes_info = Some((ae_ver, strength, actual_method));
+            }
+            pos += sz;
+        }
+    }
+
+    pub fn parse_zip_central_directory(archive_bytes: &[u8]) -> Result<Vec<ZipEntryMeta>, String> {
+        if archive_bytes.len() < 22 {
+            return Err("File too small to be a valid .zip archive".to_string());
+        }
+        let max_back = archive_bytes.len().min(65557);
+        let search_start = archive_bytes.len() - max_back;
+        let mut eocd_pos = None;
+        for pos in (search_start..=archive_bytes.len() - 22).rev() {
+            if &archive_bytes[pos..pos + 4] == b"PK\x05\x06" {
+                eocd_pos = Some(pos);
+                break;
+            }
+        }
+        let eocd = eocd_pos.ok_or_else(|| "Could not find .zip End of Central Directory".to_string())?;
+        let mut num_entries =
+            u16::from_le_bytes([archive_bytes[eocd + 10], archive_bytes[eocd + 11]]) as u64;
+        let mut cd_offset = u32::from_le_bytes([
+            archive_bytes[eocd + 16],
+            archive_bytes[eocd + 17],
+            archive_bytes[eocd + 18],
+            archive_bytes[eocd + 19],
+        ]) as u64;
+
+        // Check for ZIP64 EOCD Locator immediately preceding EOCD
+        if eocd >= 20 && &archive_bytes[eocd - 20..eocd - 16] == b"PK\x06\x07" {
+            let z64_eocd_off = u64::from_le_bytes(
+                archive_bytes[eocd - 12..eocd - 4].try_into().unwrap(),
+            ) as usize;
+            if z64_eocd_off + 56 <= archive_bytes.len()
+                && &archive_bytes[z64_eocd_off..z64_eocd_off + 4] == b"PK\x06\x06"
+            {
+                num_entries = u64::from_le_bytes(
+                    archive_bytes[z64_eocd_off + 32..z64_eocd_off + 40]
+                        .try_into()
+                        .unwrap(),
+                );
+                cd_offset = u64::from_le_bytes(
+                    archive_bytes[z64_eocd_off + 48..z64_eocd_off + 56]
+                        .try_into()
+                        .unwrap(),
+                );
+            }
+        }
+
+        let mut pos = cd_offset as usize;
+        let mut entries = Vec::with_capacity(num_entries as usize);
+        for _ in 0..num_entries {
+            if pos + 46 > archive_bytes.len() || &archive_bytes[pos..pos + 4] != b"PK\x01\x02" {
+                break;
+            }
+            let flags = u16::from_le_bytes([archive_bytes[pos + 8], archive_bytes[pos + 9]]);
+            let method = u16::from_le_bytes([archive_bytes[pos + 10], archive_bytes[pos + 11]]);
+            let mtime = u16::from_le_bytes([archive_bytes[pos + 12], archive_bytes[pos + 13]]);
+            let crc32 = u32::from_le_bytes(archive_bytes[pos + 16..pos + 20].try_into().unwrap());
+            let mut comp_size =
+                u32::from_le_bytes(archive_bytes[pos + 20..pos + 24].try_into().unwrap()) as u64;
+            let mut uncomp_size =
+                u32::from_le_bytes(archive_bytes[pos + 24..pos + 28].try_into().unwrap()) as u64;
+            let name_len =
+                u16::from_le_bytes([archive_bytes[pos + 28], archive_bytes[pos + 29]]) as usize;
+            let extra_len =
+                u16::from_le_bytes([archive_bytes[pos + 30], archive_bytes[pos + 31]]) as usize;
+            let comment_len =
+                u16::from_le_bytes([archive_bytes[pos + 32], archive_bytes[pos + 33]]) as usize;
+            let ext_attr =
+                u32::from_le_bytes(archive_bytes[pos + 38..pos + 42].try_into().unwrap());
+            let mut local_offset =
+                u32::from_le_bytes(archive_bytes[pos + 42..pos + 46].try_into().unwrap()) as u64;
+
+            let name_start = pos + 46;
+            let extra_start = name_start + name_len;
+            let next_pos = extra_start + extra_len + comment_len;
+            if next_pos > archive_bytes.len() {
+                break;
+            }
+
+            let name = String::from_utf8_lossy(&archive_bytes[name_start..extra_start]).to_string();
+            let mut aes_info = None;
+            parse_zip_extra(
+                &archive_bytes[extra_start..extra_start + extra_len],
+                &mut comp_size,
+                &mut uncomp_size,
+                &mut local_offset,
+                &mut aes_info,
+            );
+            let is_dir = name.ends_with('/') || ((ext_attr >> 16) & 0o170000) == 0o040000;
+
+            entries.push(ZipEntryMeta {
+                name,
+                method,
+                flags,
+                crc32,
+                comp_size,
+                uncomp_size,
+                local_header_offset: local_offset,
+                mtime,
+                is_dir,
+                aes_info,
+            });
+            pos = next_pos;
+        }
+        Ok(entries)
+    }
+
+    pub fn decode_zip_entry(
+        archive_bytes: &[u8],
+        entry: &ZipEntryMeta,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        if entry.is_dir {
+            return Ok(Vec::new());
+        }
+        let lpos = entry.local_header_offset as usize;
+        if lpos + 30 > archive_bytes.len() || &archive_bytes[lpos..lpos + 4] != b"PK\x03\x04" {
+            return Err(format!("Invalid local file header for {}", entry.name));
+        }
+        let lname_len =
+            u16::from_le_bytes([archive_bytes[lpos + 26], archive_bytes[lpos + 27]]) as usize;
+        let lextra_len =
+            u16::from_le_bytes([archive_bytes[lpos + 28], archive_bytes[lpos + 29]]) as usize;
+        let data_start = lpos + 30 + lname_len + lextra_len;
+        let data_end = data_start + (entry.comp_size as usize);
+        if data_end > archive_bytes.len() {
+            return Err(format!("Truncated .zip payload for {}", entry.name));
+        }
+
+        // Also check local extra field for 0x9901 if not in CD
+        let mut aes_info = entry.aes_info;
+        if aes_info.is_none() && lextra_len >= 11 {
+            let mut dummy1 = 0u64;
+            let mut dummy2 = 0u64;
+            let mut dummy3 = 0u64;
+            parse_zip_extra(
+                &archive_bytes[lpos + 30 + lname_len..data_start],
+                &mut dummy1,
+                &mut dummy2,
+                &mut dummy3,
+                &mut aes_info,
+            );
+        }
+
+        let raw_payload = &archive_bytes[data_start..data_end];
+        let is_encrypted = (entry.flags & 1) != 0 || entry.method == 99;
+
+        let (actual_method, compressed_stream, check_crc) = if entry.method == 99 {
+            // WinZip AES-128 / AES-192 / AES-256 (0x9901)
+            let pw = password
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("Password required (-p<password>) to decrypt {}", entry.name))?;
+            let (ae_ver, strength, act_method) =
+                aes_info.unwrap_or((2, 3, 8)); // Default AE-2, AES-256, DEFLATE
+            let (salt_len, key_len) = match strength {
+                1 => (8usize, 16usize),
+                2 => (12usize, 24usize),
+                _ => (16usize, 32usize),
+            };
+            if raw_payload.len() < salt_len + 12 {
+                return Err(format!("Invalid WinZip AES payload size for {}", entry.name));
+            }
+            let salt = &raw_payload[..salt_len];
+            let pw_verify = &raw_payload[salt_len..salt_len + 2];
+            let ciphertext = &raw_payload[salt_len + 2..raw_payload.len() - 10];
+            let auth_code = &raw_payload[raw_payload.len() - 10..];
+
+            let dk = pbkdf2_hmac_sha1(pw.as_bytes(), salt, 1000, key_len * 2 + 2);
+            let aes_key = &dk[..key_len];
+            let hmac_key = &dk[key_len..key_len * 2];
+            let expected_verify = &dk[key_len * 2..key_len * 2 + 2];
+
+            if pw_verify != expected_verify {
+                return Err(format!("Wrong password for WinZip AES entry {}", entry.name));
+            }
+            let mac = hmac_sha1(hmac_key, ciphertext);
+            if &mac[..10] != auth_code {
+                return Err(format!(
+                    "HMAC-SHA1-80 authentication failed for {}",
+                    entry.name
+                ));
+            }
+            let mut decrypted = ciphertext.to_vec();
+            unsafe {
+                oz_aes_ctr_le_crypt(
+                    aes_key.as_ptr(),
+                    aes_key.len(),
+                    decrypted.as_mut_ptr(),
+                    decrypted.len(),
+                );
+            }
+            (act_method, decrypted, ae_ver == 1 && entry.crc32 != 0)
+        } else if is_encrypted {
+            // Traditional PKWARE ZipCrypto
+            let pw = password
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("Password required (-p<password>) to decrypt {}", entry.name))?;
+            if raw_payload.len() < 12 {
+                return Err(format!("Truncated ZipCrypto header for {}", entry.name));
+            }
+            let mut keys = ZipCryptoKeys::new(pw.as_bytes());
+            let mut hdr = [0u8; 12];
+            for i in 0..12 {
+                hdr[i] = keys.decrypt_byte(raw_payload[i]);
+            }
+            let check_byte_crc = ((entry.crc32 >> 24) & 0xFF) as u8;
+            let check_byte_time = ((entry.mtime >> 8) & 0xFF) as u8;
+            if hdr[11] != check_byte_crc && hdr[11] != check_byte_time {
+                return Err(format!("Wrong password for ZipCrypto entry {}", entry.name));
+            }
+            let mut decrypted = Vec::with_capacity(raw_payload.len() - 12);
+            for &b in &raw_payload[12..] {
+                decrypted.push(keys.decrypt_byte(b));
+            }
+            (entry.method, decrypted, true)
+        } else {
+            (entry.method, raw_payload.to_vec(), true)
+        };
+
+        let uncompressed = match actual_method {
+            0 => compressed_stream,
+            8 => inflate_raw(&compressed_stream)?,
+            m => {
+                return Err(format!(
+                    "Unsupported .zip compression method {} on {}",
+                    m, entry.name
+                ))
+            }
+        };
+
+        if uncompressed.len() as u64 != entry.uncomp_size {
+            return Err(format!(
+                "Size mismatch on {} (expected {}, got {})",
+                entry.name,
+                entry.uncomp_size,
+                uncompressed.len()
+            ));
+        }
+        if check_crc && entry.uncomp_size > 0 {
+            let calc_crc = crc32_fast(&uncompressed);
+            if calc_crc != entry.crc32 {
+                return Err(format!("CRC32 mismatch on {}", entry.name));
+            }
+        }
+        Ok(uncompressed)
+    }
+
+    pub fn write_zip_archive(
+        archive_path: &Path,
+        inputs: &[PathBuf],
+        level: i32,
+        password: Option<&str>,
+        use_zipcrypto: bool,
+        num_threads: usize,
+    ) -> std::io::Result<(usize, usize, u64)> {
+        let mut raw_files: Vec<(String, PathBuf, usize)> = Vec::new();
+        for p in inputs {
+            collect_files_recursive(p, p, &mut raw_files);
+        }
+        let pw_opt = password.filter(|s| !s.is_empty());
+
+        #[derive(Clone)]
+        struct PreparedZipItem {
+            rel_path: String,
+            uncomp_size: u32,
+            crc32: u32,
+            method: u16,
+            flags: u16,
+            extra: Vec<u8>,
+            payload: Vec<u8>,
+        }
+
+        let results: Mutex<Vec<(usize, PreparedZipItem)>> =
+            Mutex::new(Vec::with_capacity(raw_files.len()));
+        let next_idx = AtomicUsize::new(0);
+        let workers = num_threads.min(raw_files.len().max(1));
+
+        run_workers(workers, || loop {
+            let i = next_idx.fetch_add(1, Ordering::Relaxed);
+            if i >= raw_files.len() {
+                break;
+            }
+            let (ref rel_path, ref full_path, sz) = raw_files[i];
+            let mut raw = vec![0u8; sz];
+            if sz > 0 {
+                if let Ok(mut f) = File::open(full_path) {
+                    let _ = os_mmap::read_into_slice_mmap_or_read(&mut f, &mut raw);
+                }
+            }
+            let crc = crc32_fast(&raw);
+            let (actual_method, comp_bytes) = if level <= 0 || sz == 0 {
+                (0u16, raw)
+            } else {
+                let def = deflate_compress(&raw, level);
+                if def.len() < raw.len() {
+                    (8u16, def)
+                } else {
+                    (0u16, raw)
+                }
+            };
+
+            let (method, flags, extra, payload) = if let Some(pw) = pw_opt {
+                if use_zipcrypto {
+                    // Traditional PKWARE ZipCrypto
+                    let mut keys = ZipCryptoKeys::new(pw.as_bytes());
+                    let seed = sha256_fast(rel_path.as_bytes());
+                    let mut enc = Vec::with_capacity(12 + comp_bytes.len());
+                    for k in 0..11 {
+                        enc.push(keys.encrypt_byte(seed[k]));
+                    }
+                    enc.push(keys.encrypt_byte(((crc >> 24) & 0xFF) as u8));
+                    for &b in &comp_bytes {
+                        enc.push(keys.encrypt_byte(b));
+                    }
+                    (actual_method, 0x0801u16, Vec::new(), enc)
+                } else {
+                    // WinZip AES-256 (0x9901, AE-1)
+                    let seed = sha256_fast(rel_path.as_bytes());
+                    let salt = &seed[0..16];
+                    let dk = pbkdf2_hmac_sha1(pw.as_bytes(), salt, 1000, 66);
+                    let aes_key = &dk[0..32];
+                    let hmac_key = &dk[32..64];
+                    let pw_verify = &dk[64..66];
+
+                    let mut ctext = comp_bytes;
+                    unsafe {
+                        oz_aes_ctr_le_crypt(
+                            aes_key.as_ptr(),
+                            aes_key.len(),
+                            ctext.as_mut_ptr(),
+                            ctext.len(),
+                        );
+                    }
+                    let mac = hmac_sha1(hmac_key, &ctext);
+                    let mut enc = Vec::with_capacity(16 + 2 + ctext.len() + 10);
+                    enc.extend_from_slice(salt);
+                    enc.extend_from_slice(pw_verify);
+                    enc.extend_from_slice(&ctext);
+                    enc.extend_from_slice(&mac[..10]);
+
+                    // Extra field 0x9901 (7 bytes body): AE-1 (ver=1), "AE", strength=3 (AES-256), actual_method
+                    let mut ext = Vec::with_capacity(11);
+                    ext.extend_from_slice(&0x9901u16.to_le_bytes());
+                    ext.extend_from_slice(&7u16.to_le_bytes());
+                    ext.extend_from_slice(&1u16.to_le_bytes()); // AE-1
+                    ext.extend_from_slice(b"AE");
+                    ext.push(3u8); // AES-256
+                    ext.extend_from_slice(&actual_method.to_le_bytes());
+
+                    (99u16, 0x0801u16, ext, enc)
+                }
+            } else {
+                (actual_method, 0x0800u16, Vec::new(), comp_bytes)
+            };
+
+            results.lock().unwrap().push((
+                i,
+                PreparedZipItem {
+                    rel_path: rel_path.clone(),
+                    uncomp_size: sz as u32,
+                    crc32: crc,
+                    method,
+                    flags,
+                    extra,
+                    payload,
+                },
+            ));
+        });
+
+        let mut items = results.into_inner().unwrap();
+        items.sort_by_key(|(i, _)| *i);
+
+        let mut out = File::create(archive_path)?;
+        let mut cd = Vec::new();
+        let mut offset = 0u32;
+        let mut total_uncomp = 0usize;
+
+        for (_, item) in &items {
+            total_uncomp += item.uncomp_size as usize;
+            let name_bytes = item.rel_path.as_bytes();
+            let comp_len = item.payload.len() as u32;
+            let ver_needed: u16 = if item.method == 99 { 51 } else { 20 };
+
+            // Local File Header (30 bytes + name + extra)
+            let mut lhdr = Vec::with_capacity(30 + name_bytes.len() + item.extra.len());
+            lhdr.extend_from_slice(b"PK\x03\x04");
+            lhdr.extend_from_slice(&ver_needed.to_le_bytes());
+            lhdr.extend_from_slice(&item.flags.to_le_bytes());
+            lhdr.extend_from_slice(&item.method.to_le_bytes());
+            lhdr.extend_from_slice(&0u16.to_le_bytes()); // mtime
+            lhdr.extend_from_slice(&0x5421u16.to_le_bytes()); // mdate
+            lhdr.extend_from_slice(&item.crc32.to_le_bytes());
+            lhdr.extend_from_slice(&comp_len.to_le_bytes());
+            lhdr.extend_from_slice(&item.uncomp_size.to_le_bytes());
+            lhdr.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            lhdr.extend_from_slice(&(item.extra.len() as u16).to_le_bytes());
+            lhdr.extend_from_slice(name_bytes);
+            lhdr.extend_from_slice(&item.extra);
+
+            out.write_all(&lhdr)?;
+            out.write_all(&item.payload)?;
+
+            // Central Directory Header (46 bytes + name + extra)
+            cd.extend_from_slice(b"PK\x01\x02");
+            cd.extend_from_slice(&ver_needed.to_le_bytes());
+            cd.extend_from_slice(&ver_needed.to_le_bytes());
+            cd.extend_from_slice(&item.flags.to_le_bytes());
+            cd.extend_from_slice(&item.method.to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes());
+            cd.extend_from_slice(&0x5421u16.to_le_bytes());
+            cd.extend_from_slice(&item.crc32.to_le_bytes());
+            cd.extend_from_slice(&comp_len.to_le_bytes());
+            cd.extend_from_slice(&item.uncomp_size.to_le_bytes());
+            cd.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            cd.extend_from_slice(&(item.extra.len() as u16).to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            cd.extend_from_slice(&0u16.to_le_bytes()); // disk number
+            cd.extend_from_slice(&0u16.to_le_bytes()); // internal attr
+            cd.extend_from_slice(&0u32.to_le_bytes()); // external attr
+            cd.extend_from_slice(&offset.to_le_bytes());
+            cd.extend_from_slice(name_bytes);
+            cd.extend_from_slice(&item.extra);
+
+            offset = offset.wrapping_add((lhdr.len() + item.payload.len()) as u32);
+        }
+
+        let cd_offset = offset;
+        let cd_size = cd.len() as u32;
+        out.write_all(&cd)?;
+
+        // End of Central Directory (22 bytes)
+        let mut eocd = Vec::with_capacity(22);
+        eocd.extend_from_slice(b"PK\x05\x06");
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        eocd.extend_from_slice(&(items.len() as u16).to_le_bytes());
+        eocd.extend_from_slice(&(items.len() as u16).to_le_bytes());
+        eocd.extend_from_slice(&cd_size.to_le_bytes());
+        eocd.extend_from_slice(&cd_offset.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        out.write_all(&eocd)?;
+
+        let total_archive_bytes = (cd_offset as u64) + (cd_size as u64) + 22;
+        Ok((items.len(), total_uncomp, total_archive_bytes))
+    }
+
+    /* --- 5. Native .gz & POSIX .tar / .tar.gz / .tgz Support --- */
+
+    pub fn gzip_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+        if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B || data[2] != 0x08 {
+            return Err("Invalid gzip header".to_string());
+        }
+        let flg = data[3];
+        let mut pos = 10usize;
+        if (flg & 0x04) != 0 {
+            if pos + 2 > data.len() {
+                return Err("Truncated gzip FEXTRA".to_string());
+            }
+            let xlen = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2 + xlen;
+        }
+        if (flg & 0x08) != 0 {
+            while pos < data.len() && data[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x10) != 0 {
+            while pos < data.len() && data[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x02) != 0 {
+            pos += 2;
+        }
+        if pos + 8 > data.len() {
+            return Err("Truncated gzip stream".to_string());
+        }
+        let deflate_slice = &data[pos..data.len() - 8];
+        let expected_crc = u32::from_le_bytes(data[data.len() - 8..data.len() - 4].try_into().unwrap());
+        let out = inflate_raw(deflate_slice)?;
+        let calc_crc = crc32_fast(&out);
+        if calc_crc != expected_crc {
+            return Err("Gzip CRC32 mismatch".to_string());
+        }
+        Ok(out)
+    }
+
+    pub fn gzip_compress(data: &[u8], level: i32) -> Vec<u8> {
+        let deflated = deflate_compress(data, level);
+        let crc = crc32_fast(data);
+        let isize_val = (data.len() as u32).to_le_bytes();
+        let mut out = Vec::with_capacity(10 + deflated.len() + 8);
+        out.extend_from_slice(&[0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03]);
+        out.extend_from_slice(&deflated);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&isize_val);
+        out
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct TarEntry {
+        pub name: String,
+        pub is_dir: bool,
+        pub data: Vec<u8>,
+    }
+
+    pub fn parse_tar_bytes(tar: &[u8]) -> Result<Vec<TarEntry>, String> {
+        let mut pos = 0usize;
+        let mut entries = Vec::new();
+        let mut next_long_name: Option<String> = None;
+
+        while pos + 512 <= tar.len() {
+            let blk = &tar[pos..pos + 512];
+            if blk.iter().all(|&b| b == 0) {
+                break;
+            }
+            let raw_name = blk[0..100]
+                .split(|&b| b == 0)
+                .next()
+                .unwrap_or(&[]);
+            let prefix = blk[345..500]
+                .split(|&b| b == 0)
+                .next()
+                .unwrap_or(&[]);
+            let mut name = if !prefix.is_empty() {
+                format!(
+                    "{}/{}",
+                    String::from_utf8_lossy(prefix),
+                    String::from_utf8_lossy(raw_name)
+                )
+            } else {
+                String::from_utf8_lossy(raw_name).to_string()
+            };
+            if let Some(long_n) = next_long_name.take() {
+                name = long_n;
+            }
+
+            let size_str = std::str::from_utf8(&blk[124..136])
+                .unwrap_or("")
+                .trim_matches(|c: char| c == '\0' || c.is_whitespace());
+            let size = usize::from_str_radix(size_str, 8).unwrap_or(0);
+            let typeflag = blk[156];
+            pos += 512;
+            if pos + size > tar.len() {
+                break;
+            }
+            let payload = &tar[pos..pos + size];
+            pos += (size + 511) & !511;
+
+            if typeflag == b'L' {
+                let s = String::from_utf8_lossy(payload)
+                    .trim_end_matches('\0')
+                    .to_string();
+                next_long_name = Some(s);
+                continue;
+            } else if typeflag == b'x' || typeflag == b'g' {
+                continue;
+            }
+
+            let is_dir = typeflag == b'5' || name.ends_with('/');
+            entries.push(TarEntry {
+                name,
+                is_dir,
+                data: payload.to_vec(),
+            });
+        }
+        Ok(entries)
+    }
+
+    pub fn build_tar_bytes(inputs: &[PathBuf]) -> std::io::Result<(usize, usize, Vec<u8>)> {
+        let mut raw_files: Vec<(String, PathBuf, usize)> = Vec::new();
+        for p in inputs {
+            collect_files_recursive(p, p, &mut raw_files);
+        }
+        let mut tar = Vec::new();
+        let mut total_uncomp = 0usize;
+        for (rel_path, full_path, sz) in &raw_files {
+            total_uncomp += *sz;
+            let mut hdr = [0u8; 512];
+            let name_bytes = rel_path.as_bytes();
+            let copy_len = name_bytes.len().min(100);
+            hdr[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+            hdr[100..107].copy_from_slice(b"0000644");
+            hdr[108..115].copy_from_slice(b"0000000");
+            hdr[116..123].copy_from_slice(b"0000000");
+            let sz_oct = format!("{:011o}\0", sz);
+            hdr[124..136].copy_from_slice(sz_oct.as_bytes());
+            hdr[136..148].copy_from_slice(b"14600000000\0");
+            hdr[148..156].fill(b' ');
+            hdr[156] = b'0';
+            hdr[257..263].copy_from_slice(b"ustar\0");
+            hdr[263..265].copy_from_slice(b"00");
+            let chksum: u32 = hdr.iter().map(|&b| b as u32).sum();
+            let chk_oct = format!("{:06o}\0 ", chksum);
+            hdr[148..156].copy_from_slice(chk_oct.as_bytes());
+
+            tar.extend_from_slice(&hdr);
+            if *sz > 0 {
+                let data = fs::read(full_path)?;
+                tar.extend_from_slice(&data);
+                let rem = data.len() % 512;
+                if rem != 0 {
+                    tar.resize(tar.len() + (512 - rem), 0);
+                }
+            }
+        }
+        tar.resize(tar.len() + 1024, 0);
+        Ok((raw_files.len(), total_uncomp, tar))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    SevenZip,
+    Zip,
+    TarGz,
+    Tar,
+    Gzip,
+}
+
+pub fn detect_archive_format(path: &Path, check_magic: bool) -> ArchiveFormat {
+    if check_magic {
+        if let Ok(mut f) = File::open(path) {
+            let mut magic = [0u8; 6];
+            if std::io::Read::read(&mut f, &mut magic).unwrap_or(0) >= 4 {
+                if magic == [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C] {
+                    return ArchiveFormat::SevenZip;
+                }
+                if &magic[0..4] == b"PK\x03\x04" || &magic[0..4] == b"PK\x05\x06" {
+                    return ArchiveFormat::Zip;
+                }
+                if magic[0] == 0x1F && magic[1] == 0x8B {
+                    let s = path.to_string_lossy().to_ascii_lowercase();
+                    if s.ends_with(".tar.gz") || s.ends_with(".tgz") {
+                        return ArchiveFormat::TarGz;
+                    }
+                    return ArchiveFormat::Gzip;
+                }
+            }
+        }
+    }
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    if lower.ends_with(".zip") || lower.ends_with(".jar") || lower.ends_with(".whl") {
+        ArchiveFormat::Zip
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        ArchiveFormat::TarGz
+    } else if lower.ends_with(".tar") {
+        ArchiveFormat::Tar
+    } else if lower.ends_with(".gz") {
+        ArchiveFormat::Gzip
+    } else {
+        ArchiveFormat::SevenZip
+    }
+}
+
 fn run_benchmarks(num_threads: usize) {
     println!("================================================================================");
     println!("  OpenZip v1.0.0 : High-Performance Cross-Platform Archiver + BCJ/Delta + SIMD");
@@ -1323,122 +2819,371 @@ fn main() {
         "bench" | "b" => run_benchmarks(num_threads),
         "a" => {
             let mut level = 5;
-            let mut pos = 2;
-            while pos < args.len() {
-                if let Some(rest) = args[pos].strip_prefix("-mx") {
+            let mut password: Option<String> = None;
+            let mut use_zipcrypto = false;
+            let mut positional: Vec<String> = Vec::new();
+            for a in &args[2..] {
+                if let Some(rest) = a.strip_prefix("-mx") {
                     level = rest.parse::<i32>().unwrap_or(5);
-                    pos += 1;
-                } else if args[pos] == "-y" {
-                    pos += 1;
+                } else if let Some(pw) = a.strip_prefix("-p") {
+                    password = Some(pw.to_string());
+                } else if a.eq_ignore_ascii_case("-mem=zipcrypto") {
+                    use_zipcrypto = true;
+                } else if a == "-y" || a.starts_with("-mhe") || a.starts_with("-t") {
+                    // Accepted for 7-Zip CLI compatibility
                 } else {
-                    break;
+                    positional.push(a.clone());
                 }
             }
-            if pos + 1 >= args.len() {
-                eprintln!("Usage: openzip a [-mxN] <archive.7z> <paths...>");
+            if positional.len() < 2 {
+                eprintln!(
+                    "Usage: openzip a [-mxN] [-p<password>] <archive.7z|.zip|.tar.gz|.tar|.gz> <paths...>"
+                );
                 std::process::exit(1);
             }
-            let archive_path = PathBuf::from(&args[pos]);
-            let inputs: Vec<PathBuf> = args[pos + 1..].iter().map(PathBuf::from).collect();
+            let archive_path = PathBuf::from(&positional[0]);
+            let inputs: Vec<PathBuf> = positional[1..].iter().map(PathBuf::from).collect();
+            let fmt = detect_archive_format(&archive_path, false);
             let t0 = Instant::now();
-            let (entries, folders) = parallel_ingest_and_compress(&inputs, level, num_threads);
-            let uncomp_len: usize = folders.iter().map(|f| f.unpack_size).sum();
-            let sz = write_standard_archive(&archive_path, &entries, &folders)
-                .expect("Failed to write .7z archive");
-            println!(
-                "Archived {} files ({} bytes -> {} bytes) into standard .7z in {:.1} ms",
-                entries.len(),
-                uncomp_len,
-                sz,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        "t" => {
-            if args.len() < 3 {
-                eprintln!("Usage: openzip t <archive.7z>");
-                std::process::exit(1);
-            }
-            let archive_path = PathBuf::from(&args[2]);
-            let t0 = Instant::now();
-            let (files, folder_bufs) =
-                read_and_decompress_archive(&archive_path, num_threads)
-                    .expect("Failed to read/verify .7z archive");
-            let total_uncomp: usize = folder_bufs.iter().map(|b| b.len()).sum();
-            println!(
-                "Everything is Ok ({} files, {} bytes verified in {:.1} ms)",
-                files.len(),
-                total_uncomp,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        "l" => {
-            if args.len() < 3 {
-                eprintln!("Usage: openzip l <archive.7z>");
-                std::process::exit(1);
-            }
-            let archive_path = PathBuf::from(&args[2]);
-            let mut f = File::open(&archive_path).expect("Failed to open .7z archive");
-            let len = f.metadata().unwrap().len() as usize;
-            let mut archive_bytes = Vec::with_capacity(len);
-            unsafe {
-                archive_bytes.set_len(len);
-            }
-            os_mmap::read_into_slice_mmap_or_read(&mut f, &mut archive_bytes).unwrap();
-            let handle = unsafe { oz_open_archive(archive_bytes.as_ptr(), archive_bytes.len()) };
-            assert!(!handle.is_null(), "Failed to parse .7z header");
-            let num_files = unsafe { oz_archive_num_files(handle) } as usize;
-            let mut utf16_buf = vec![0u16; 4096];
-            let mut total_size = 0usize;
-            println!("{:>12}  {:>8}  {}", "Size", "CRC32", "Name");
-            println!("------------  --------  ------------------------");
-            for i in 0..num_files {
-                let mut name_len = 0usize;
-                let mut folder_idx = u32::MAX;
-                let mut offset_in_folder = 0usize;
-                let mut size = 0usize;
-                let mut crc32 = 0u32;
-                let mut has_crc = 0i32;
-                let mut is_dir = 0i32;
-                unsafe {
-                    oz_archive_get_file_info(
-                        handle,
-                        i as u32,
-                        utf16_buf.as_mut_ptr(),
-                        utf16_buf.len(),
-                        &mut name_len,
-                        &mut folder_idx,
-                        &mut offset_in_folder,
-                        &mut size,
-                        &mut crc32,
-                        &mut has_crc,
-                        &mut is_dir,
+
+            match fmt {
+                ArchiveFormat::SevenZip => {
+                    set_global_password(password.as_deref());
+                    let (entries, folders) =
+                        parallel_ingest_and_compress(&inputs, level, num_threads);
+                    let uncomp_len: usize = folders.iter().map(|f| f.unpack_size).sum();
+                    let sz = write_standard_archive_with_password(
+                        &archive_path,
+                        &entries,
+                        &folders,
+                        password.as_deref(),
+                    )
+                    .expect("Failed to write .7z archive");
+                    println!(
+                        "Archived {} files ({} bytes -> {} bytes) into {} .7z in {:.1} ms",
+                        entries.len(),
+                        uncomp_len,
+                        sz,
+                        if password.is_some() {
+                            "AES-256 encrypted"
+                        } else {
+                            "standard"
+                        },
+                        t0.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                let rel_path = String::from_utf16_lossy(&utf16_buf[..name_len]);
-                total_size += size;
-                if has_crc != 0 {
-                    println!("{:>12}  {:08X}  {}", size, crc32, rel_path);
-                } else {
-                    println!("{:>12}  {:>8}  {}", size, "-", rel_path);
+                ArchiveFormat::Zip => {
+                    let (count, uncomp_len, sz) = multi_format::write_zip_archive(
+                        &archive_path,
+                        &inputs,
+                        level,
+                        password.as_deref(),
+                        use_zipcrypto,
+                        num_threads,
+                    )
+                    .expect("Failed to write .zip archive");
+                    println!(
+                        "Archived {} files ({} bytes -> {} bytes) into {} .zip in {:.1} ms",
+                        count,
+                        uncomp_len,
+                        sz,
+                        if password.is_some() {
+                            if use_zipcrypto {
+                                "ZipCrypto encrypted"
+                            } else {
+                                "WinZip AES-256 encrypted"
+                            }
+                        } else {
+                            "standard"
+                        },
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Tar => {
+                    let (count, uncomp_len, tar_bytes) =
+                        multi_format::build_tar_bytes(&inputs).expect("Failed to build .tar");
+                    fs::write(&archive_path, &tar_bytes).expect("Failed to write .tar");
+                    println!(
+                        "Archived {} files ({} bytes -> {} bytes) into .tar in {:.1} ms",
+                        count,
+                        uncomp_len,
+                        tar_bytes.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::TarGz => {
+                    let (count, uncomp_len, tar_bytes) =
+                        multi_format::build_tar_bytes(&inputs).expect("Failed to build .tar");
+                    let gz_bytes = multi_format::gzip_compress(&tar_bytes, level);
+                    fs::write(&archive_path, &gz_bytes).expect("Failed to write .tar.gz");
+                    println!(
+                        "Archived {} files ({} bytes -> {} bytes) into .tar.gz in {:.1} ms",
+                        count,
+                        uncomp_len,
+                        gz_bytes.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Gzip => {
+                    let raw = fs::read(&inputs[0]).expect("Failed to read input file for .gz");
+                    let gz_bytes = multi_format::gzip_compress(&raw, level);
+                    fs::write(&archive_path, &gz_bytes).expect("Failed to write .gz");
+                    println!(
+                        "Archived 1 file ({} bytes -> {} bytes) into .gz in {:.1} ms",
+                        raw.len(),
+                        gz_bytes.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
             }
-            unsafe {
-                oz_close_archive(handle);
+        }
+        "t" => {
+            let mut password: Option<String> = None;
+            let mut archive_path = PathBuf::new();
+            for a in &args[2..] {
+                if let Some(pw) = a.strip_prefix("-p") {
+                    password = Some(pw.to_string());
+                } else if a != "-y" && archive_path.as_os_str().is_empty() {
+                    archive_path = PathBuf::from(a);
+                }
             }
-            println!("------------  --------  ------------------------");
-            println!("{:>12}            {} files ({} archive bytes)", total_size, num_files, len);
+            if archive_path.as_os_str().is_empty() {
+                eprintln!("Usage: openzip t [-p<password>] <archive>");
+                std::process::exit(1);
+            }
+            set_global_password(password.as_deref());
+            let fmt = detect_archive_format(&archive_path, true);
+            let t0 = Instant::now();
+
+            match fmt {
+                ArchiveFormat::SevenZip => {
+                    let (files, folder_bufs) =
+                        read_and_decompress_archive(&archive_path, num_threads)
+                            .expect("Failed to read/verify .7z archive");
+                    let total_uncomp: usize = folder_bufs.iter().map(|b| b.len()).sum();
+                    println!(
+                        "Everything is Ok ({} files, {} bytes verified in {:.1} ms)",
+                        files.len(),
+                        total_uncomp,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Zip => {
+                    let archive_bytes = fs::read(&archive_path).expect("Failed to read .zip");
+                    let entries = multi_format::parse_zip_central_directory(&archive_bytes)
+                        .expect("Failed to parse .zip directory");
+                    let mut total_uncomp = 0usize;
+                    for e in &entries {
+                        let dec = multi_format::decode_zip_entry(
+                            &archive_bytes,
+                            e,
+                            password.as_deref(),
+                        )
+                        .unwrap_or_else(|err| panic!("Verification failed: {}", err));
+                        total_uncomp += dec.len();
+                    }
+                    println!(
+                        "Everything is Ok ({} files, {} bytes verified in {:.1} ms)",
+                        entries.len(),
+                        total_uncomp,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::TarGz => {
+                    let raw = fs::read(&archive_path).expect("Failed to read .tar.gz");
+                    let tar = multi_format::gzip_decompress(&raw).expect("Invalid .tar.gz");
+                    let entries =
+                        multi_format::parse_tar_bytes(&tar).expect("Invalid .tar payload");
+                    let total_uncomp: usize = entries.iter().map(|e| e.data.len()).sum();
+                    println!(
+                        "Everything is Ok ({} files, {} bytes verified in {:.1} ms)",
+                        entries.len(),
+                        total_uncomp,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Tar => {
+                    let raw = fs::read(&archive_path).expect("Failed to read .tar");
+                    let entries =
+                        multi_format::parse_tar_bytes(&raw).expect("Invalid .tar archive");
+                    let total_uncomp: usize = entries.iter().map(|e| e.data.len()).sum();
+                    println!(
+                        "Everything is Ok ({} files, {} bytes verified in {:.1} ms)",
+                        entries.len(),
+                        total_uncomp,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Gzip => {
+                    let raw = fs::read(&archive_path).expect("Failed to read .gz");
+                    let dec = multi_format::gzip_decompress(&raw).expect("Invalid .gz archive");
+                    println!(
+                        "Everything is Ok (1 file, {} bytes verified in {:.1} ms)",
+                        dec.len(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
+        }
+        "l" => {
+            let mut password: Option<String> = None;
+            let mut archive_path = PathBuf::new();
+            for a in &args[2..] {
+                if let Some(pw) = a.strip_prefix("-p") {
+                    password = Some(pw.to_string());
+                } else if a != "-y" && archive_path.as_os_str().is_empty() {
+                    archive_path = PathBuf::from(a);
+                }
+            }
+            if archive_path.as_os_str().is_empty() {
+                eprintln!("Usage: openzip l [-p<password>] <archive>");
+                std::process::exit(1);
+            }
+            set_global_password(password.as_deref());
+            let fmt = detect_archive_format(&archive_path, true);
+
+            match fmt {
+                ArchiveFormat::SevenZip => {
+                    let mut f = File::open(&archive_path).expect("Failed to open .7z archive");
+                    let len = f.metadata().unwrap().len() as usize;
+                    let mut archive_bytes = Vec::with_capacity(len);
+                    unsafe {
+                        archive_bytes.set_len(len);
+                    }
+                    os_mmap::read_into_slice_mmap_or_read(&mut f, &mut archive_bytes).unwrap();
+                    let handle =
+                        unsafe { oz_open_archive(archive_bytes.as_ptr(), archive_bytes.len()) };
+                    assert!(
+                        !handle.is_null(),
+                        "Failed to parse .7z header (if headers are encrypted, pass -p<password>)"
+                    );
+                    let num_files = unsafe { oz_archive_num_files(handle) } as usize;
+                    let mut utf16_buf = vec![0u16; 4096];
+                    let mut total_size = 0usize;
+                    println!("{:>12}  {:>8}  {}", "Size", "CRC32", "Name");
+                    println!("------------  --------  ------------------------");
+                    for i in 0..num_files {
+                        let mut name_len = 0usize;
+                        let mut folder_idx = u32::MAX;
+                        let mut offset_in_folder = 0usize;
+                        let mut size = 0usize;
+                        let mut crc32 = 0u32;
+                        let mut has_crc = 0i32;
+                        let mut is_dir = 0i32;
+                        unsafe {
+                            oz_archive_get_file_info(
+                                handle,
+                                i as u32,
+                                utf16_buf.as_mut_ptr(),
+                                utf16_buf.len(),
+                                &mut name_len,
+                                &mut folder_idx,
+                                &mut offset_in_folder,
+                                &mut size,
+                                &mut crc32,
+                                &mut has_crc,
+                                &mut is_dir,
+                            );
+                        }
+                        let rel_path = String::from_utf16_lossy(&utf16_buf[..name_len]);
+                        total_size += size;
+                        if has_crc != 0 {
+                            println!("{:>12}  {:08X}  {}", size, crc32, rel_path);
+                        } else {
+                            println!("{:>12}  {:>8}  {}", size, "-", rel_path);
+                        }
+                    }
+                    unsafe {
+                        oz_close_archive(handle);
+                    }
+                    println!("------------  --------  ------------------------");
+                    println!(
+                        "{:>12}            {} files ({} archive bytes)",
+                        total_size, num_files, len
+                    );
+                }
+                ArchiveFormat::Zip => {
+                    let archive_bytes = fs::read(&archive_path).expect("Failed to read .zip");
+                    let entries = multi_format::parse_zip_central_directory(&archive_bytes)
+                        .expect("Failed to parse .zip directory");
+                    let mut total_size = 0u64;
+                    println!("{:>12}  {:>8}  {}", "Size", "CRC32", "Name");
+                    println!("------------  --------  ------------------------");
+                    for e in &entries {
+                        total_size += e.uncomp_size;
+                        let enc_tag = if e.method == 99 || (e.flags & 1) != 0 {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "{:>12}  {:08X}  {}{}",
+                            e.uncomp_size, e.crc32, e.name, enc_tag
+                        );
+                    }
+                    println!("------------  --------  ------------------------");
+                    println!(
+                        "{:>12}            {} files ({} archive bytes)",
+                        total_size,
+                        entries.len(),
+                        archive_bytes.len()
+                    );
+                }
+                ArchiveFormat::TarGz | ArchiveFormat::Tar => {
+                    let raw = fs::read(&archive_path).expect("Failed to read archive");
+                    let tar = if fmt == ArchiveFormat::TarGz {
+                        multi_format::gzip_decompress(&raw).expect("Invalid .tar.gz")
+                    } else {
+                        raw.clone()
+                    };
+                    let entries =
+                        multi_format::parse_tar_bytes(&tar).expect("Invalid .tar archive");
+                    let mut total_size = 0usize;
+                    println!("{:>12}  {:>8}  {}", "Size", "CRC32", "Name");
+                    println!("------------  --------  ------------------------");
+                    for e in &entries {
+                        total_size += e.data.len();
+                        let crc = crc32_fast(&e.data);
+                        println!("{:>12}  {:08X}  {}", e.data.len(), crc, e.name);
+                    }
+                    println!("------------  --------  ------------------------");
+                    println!(
+                        "{:>12}            {} files ({} archive bytes)",
+                        total_size,
+                        entries.len(),
+                        raw.len()
+                    );
+                }
+                ArchiveFormat::Gzip => {
+                    let raw = fs::read(&archive_path).expect("Failed to read .gz");
+                    let dec = multi_format::gzip_decompress(&raw).expect("Invalid .gz");
+                    let crc = crc32_fast(&dec);
+                    let stem = archive_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "data".to_string());
+                    println!("{:>12}  {:>8}  {}", "Size", "CRC32", "Name");
+                    println!("------------  --------  ------------------------");
+                    println!("{:>12}  {:08X}  {}", dec.len(), crc, stem);
+                    println!("------------  --------  ------------------------");
+                    println!(
+                        "{:>12}            1 files ({} archive bytes)",
+                        dec.len(),
+                        raw.len()
+                    );
+                }
+            }
         }
         "x" | "e" => {
             let preserve_paths = cmd == "x";
-            if args.len() < 3 {
-                eprintln!("Usage: openzip {} <archive.7z> [-o<outdir>]", cmd);
-                std::process::exit(1);
-            }
+            let mut password: Option<String> = None;
             let mut archive_path = PathBuf::new();
             let mut out_dir = PathBuf::from(".");
             for a in &args[2..] {
                 if let Some(rest) = a.strip_prefix("-o") {
                     out_dir = PathBuf::from(rest);
+                } else if let Some(pw) = a.strip_prefix("-p") {
+                    password = Some(pw.to_string());
                 } else if a != "-y" {
                     if archive_path.as_os_str().is_empty() {
                         archive_path = PathBuf::from(a);
@@ -1447,70 +3192,179 @@ fn main() {
                     }
                 }
             }
-            let t0 = Instant::now();
-            let (files, folder_bufs) =
-                read_and_decompress_archive(&archive_path, num_threads)
-                    .expect("Failed to read .7z archive");
-
-            let _ = fs::create_dir_all(&out_dir);
-            if preserve_paths {
-                let mut dirs: Vec<PathBuf> = files
-                    .iter()
-                    .filter_map(|e| {
-                        let p = out_dir.join(&e.rel_path);
-                        if e.is_dir {
-                            Some(p)
-                        } else {
-                            p.parent().map(|parent| parent.to_path_buf())
-                        }
-                    })
-                    .collect();
-                dirs.sort();
-                dirs.dedup();
-                for d in &dirs {
-                    let _ = fs::create_dir_all(d);
-                }
+            if archive_path.as_os_str().is_empty() {
+                eprintln!(
+                    "Usage: openzip {} [-p<password>] <archive> [-o<outdir>]",
+                    cmd
+                );
+                std::process::exit(1);
             }
+            set_global_password(password.as_deref());
+            let fmt = detect_archive_format(&archive_path, true);
+            let t0 = Instant::now();
+            let _ = fs::create_dir_all(&out_dir);
 
-            let next_idx = AtomicUsize::new(0);
-            run_workers(num_threads.min(files.len().max(1)), || loop {
-                let i = next_idx.fetch_add(1, Ordering::Relaxed);
-                if i >= files.len() {
-                    break;
-                }
-                let e = &files[i];
-                if e.is_dir {
-                    continue;
-                }
-                let dest_path = if preserve_paths {
-                    out_dir.join(&e.rel_path)
-                } else {
-                    let fname = Path::new(&e.rel_path)
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new(&e.rel_path));
-                    out_dir.join(fname)
-                };
-                if let Ok(mut f) = File::create(&dest_path) {
-                    if e.size > 0 {
-                        if let Some(fidx) = e.folder_idx {
-                            let slice = &folder_bufs[fidx]
-                                [e.offset_in_folder..e.offset_in_folder + e.size];
-                            let _ = f.write_all(slice);
+            match fmt {
+                ArchiveFormat::SevenZip => {
+                    let (files, folder_bufs) =
+                        read_and_decompress_archive(&archive_path, num_threads)
+                            .expect("Failed to read .7z archive");
+
+                    if preserve_paths {
+                        let mut dirs: Vec<PathBuf> = files
+                            .iter()
+                            .filter_map(|e| {
+                                let p = out_dir.join(&e.rel_path);
+                                if e.is_dir {
+                                    Some(p)
+                                } else {
+                                    p.parent().map(|parent| parent.to_path_buf())
+                                }
+                            })
+                            .collect();
+                        dirs.sort();
+                        dirs.dedup();
+                        for d in &dirs {
+                            let _ = fs::create_dir_all(d);
                         }
                     }
+
+                    let next_idx = AtomicUsize::new(0);
+                    run_workers(num_threads.min(files.len().max(1)), || loop {
+                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if i >= files.len() {
+                            break;
+                        }
+                        let e = &files[i];
+                        if e.is_dir {
+                            continue;
+                        }
+                        let dest_path = if preserve_paths {
+                            out_dir.join(&e.rel_path)
+                        } else {
+                            let fname = Path::new(&e.rel_path)
+                                .file_name()
+                                .unwrap_or_else(|| std::ffi::OsStr::new(&e.rel_path));
+                            out_dir.join(fname)
+                        };
+                        if let Ok(mut f) = File::create(&dest_path) {
+                            if e.size > 0 {
+                                if let Some(fidx) = e.folder_idx {
+                                    let slice = &folder_bufs[fidx]
+                                        [e.offset_in_folder..e.offset_in_folder + e.size];
+                                    let _ = f.write_all(slice);
+                                }
+                            }
+                        }
+                    });
+                    let total_uncomp: usize = folder_bufs.iter().map(|b| b.len()).sum();
+                    println!(
+                        "Extracted {} items ({} bytes) to {} in {:.1} ms",
+                        files.len(),
+                        total_uncomp,
+                        out_dir.display(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
-            });
-            let total_uncomp: usize = folder_bufs.iter().map(|b| b.len()).sum();
-            println!(
-                "Extracted {} items ({} bytes) to {} in {:.1} ms",
-                files.len(),
-                total_uncomp,
-                out_dir.display(),
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+                ArchiveFormat::Zip => {
+                    let archive_bytes = fs::read(&archive_path).expect("Failed to read .zip");
+                    let entries = multi_format::parse_zip_central_directory(&archive_bytes)
+                        .expect("Failed to parse .zip directory");
+                    let mut total_uncomp = 0usize;
+                    for e in &entries {
+                        let dest_path = if preserve_paths {
+                            out_dir.join(&e.name)
+                        } else {
+                            let fname = Path::new(&e.name)
+                                .file_name()
+                                .unwrap_or_else(|| std::ffi::OsStr::new(&e.name));
+                            out_dir.join(fname)
+                        };
+                        if e.is_dir {
+                            if preserve_paths {
+                                let _ = fs::create_dir_all(&dest_path);
+                            }
+                            continue;
+                        }
+                        if let Some(parent) = dest_path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        let dec = multi_format::decode_zip_entry(
+                            &archive_bytes,
+                            e,
+                            password.as_deref(),
+                        )
+                        .unwrap_or_else(|err| panic!("Extraction failed: {}", err));
+                        total_uncomp += dec.len();
+                        fs::write(&dest_path, &dec).expect("Failed to write extracted file");
+                    }
+                    println!(
+                        "Extracted {} items ({} bytes) to {} in {:.1} ms",
+                        entries.len(),
+                        total_uncomp,
+                        out_dir.display(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::TarGz | ArchiveFormat::Tar => {
+                    let raw = fs::read(&archive_path).expect("Failed to read archive");
+                    let tar = if fmt == ArchiveFormat::TarGz {
+                        multi_format::gzip_decompress(&raw).expect("Invalid .tar.gz")
+                    } else {
+                        raw
+                    };
+                    let entries =
+                        multi_format::parse_tar_bytes(&tar).expect("Invalid .tar archive");
+                    let mut total_uncomp = 0usize;
+                    for e in &entries {
+                        let dest_path = if preserve_paths {
+                            out_dir.join(&e.name)
+                        } else {
+                            let fname = Path::new(&e.name)
+                                .file_name()
+                                .unwrap_or_else(|| std::ffi::OsStr::new(&e.name));
+                            out_dir.join(fname)
+                        };
+                        if e.is_dir {
+                            if preserve_paths {
+                                let _ = fs::create_dir_all(&dest_path);
+                            }
+                            continue;
+                        }
+                        if let Some(parent) = dest_path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        total_uncomp += e.data.len();
+                        fs::write(&dest_path, &e.data).expect("Failed to write extracted file");
+                    }
+                    println!(
+                        "Extracted {} items ({} bytes) to {} in {:.1} ms",
+                        entries.len(),
+                        total_uncomp,
+                        out_dir.display(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                ArchiveFormat::Gzip => {
+                    let raw = fs::read(&archive_path).expect("Failed to read .gz");
+                    let dec = multi_format::gzip_decompress(&raw).expect("Invalid .gz");
+                    let stem = archive_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "extracted_file".to_string());
+                    let dest_path = out_dir.join(stem);
+                    fs::write(&dest_path, &dec).expect("Failed to write extracted .gz file");
+                    println!(
+                        "Extracted 1 item ({} bytes) to {} in {:.1} ms",
+                        dec.len(),
+                        out_dir.display(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            }
         }
         _ => {
-            println!("Usage: openzip [bench | a [-mxN] <archive.7z> <paths...> | l <archive.7z> | t <archive.7z> | x <archive.7z> -o<dir> | e <archive.7z> -o<dir>]");
+            println!("Usage: openzip [bench | a [-mxN] [-p<password>] <archive.7z|.zip|.tar.gz|.tar|.gz> <paths...> | l [-p<pw>] <archive> | t [-p<pw>] <archive> | x [-p<pw>] <archive> -o<dir> | e [-p<pw>] <archive> -o<dir>]");
         }
     }
 }

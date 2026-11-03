@@ -5,7 +5,7 @@
 
 #include <string.h>
 
-/* #define Z7_PPMD_SUPPORT */
+#define Z7_PPMD_SUPPORT
 
 #include "OzArc.h"
 #include "OzCrc.h"
@@ -26,6 +26,53 @@
 #endif
 #define k_LZMA  0x30101
 #define k_BCJ2  0x303011B
+#define k_AES   0x06F10701u
+
+extern int oz_7zaes_decrypt_inplace(const Byte *props, unsigned propsSize, Byte *data, size_t dataSize);
+
+typedef struct
+{
+  ILookInStream vt;
+  const Byte *data;
+  size_t size;
+  size_t pos;
+} COzDecMemStream;
+
+static SRes OzDecMem_Look(ILookInStreamPtr pp, const void **buf, size_t *size)
+{
+  COzDecMemStream *p = Z7_CONTAINER_FROM_VTBL(pp, COzDecMemStream, vt);
+  size_t rem = (p->pos <= p->size) ? (p->size - p->pos) : 0;
+  if (*size > rem) *size = rem;
+  *buf = p->data + p->pos;
+  return SZ_OK;
+}
+static SRes OzDecMem_Skip(ILookInStreamPtr pp, size_t offset)
+{
+  COzDecMemStream *p = Z7_CONTAINER_FROM_VTBL(pp, COzDecMemStream, vt);
+  p->pos += offset;
+  return SZ_OK;
+}
+static SRes OzDecMem_Read(ILookInStreamPtr pp, void *buf, size_t *size)
+{
+  COzDecMemStream *p = Z7_CONTAINER_FROM_VTBL(pp, COzDecMemStream, vt);
+  size_t rem = (p->pos <= p->size) ? (p->size - p->pos) : 0;
+  if (*size > rem) *size = rem;
+  if (*size != 0) { memcpy(buf, p->data + p->pos, *size); p->pos += *size; }
+  return SZ_OK;
+}
+static SRes OzDecMem_Seek(ILookInStreamPtr pp, Int64 *pos, ESzSeek origin)
+{
+  COzDecMemStream *p = Z7_CONTAINER_FROM_VTBL(pp, COzDecMemStream, vt);
+  Int64 np = 0;
+  if (origin == SZ_SEEK_SET) np = *pos;
+  else if (origin == SZ_SEEK_CUR) np = (Int64)p->pos + *pos;
+  else if (origin == SZ_SEEK_END) np = (Int64)p->size + *pos;
+  else return SZ_ERROR_PARAM;
+  if (np < 0 || (size_t)np > p->size) return SZ_ERROR_PARAM;
+  p->pos = (size_t)np;
+  *pos = np;
+  return SZ_OK;
+}
 
 #if !defined(Z7_NO_METHODS_FILTERS)
 #define Z7_USE_BRANCH_FILTER
@@ -420,6 +467,64 @@ static SRes SzFolder_Decode2(const CSzFolder *folder,
   SizeT tempSizes[3] = { 0, 0, 0};
   SizeT tempSize3 = 0;
   Byte *tempBuf3 = 0;
+
+  if (folder->NumCoders >= 2 && folder->Coders[0].MethodID == k_AES && folder->NumPackStreams == 1)
+  {
+    const UInt64 offset = packPositions[0];
+    const UInt64 encSize64 = packPositions[1] - offset;
+    const UInt64 decSize64 = unpackSizes[0];
+    const size_t encSize = (size_t)encSize64;
+    if (encSize != encSize64 || (encSize & 15) != 0 || decSize64 > encSize64)
+      return SZ_ERROR_DATA;
+    Byte *aesBuf = (Byte *)ISzAlloc_Alloc(allocMain, encSize ? encSize : 1);
+    if (!aesBuf)
+      return SZ_ERROR_MEM;
+    SRes res = LookInStream_SeekTo(inStream, startPos + offset);
+    if (res == SZ_OK)
+      res = SzDecodeCopy(encSize64, inStream, aesBuf);
+    if (res == SZ_OK)
+    {
+      if (oz_7zaes_decrypt_inplace(
+          propsData + folder->Coders[0].PropsOffset,
+          folder->Coders[0].PropsSize,
+          aesBuf,
+          encSize) != 0)
+        res = SZ_ERROR_DATA;
+    }
+    if (res == SZ_OK)
+    {
+      CSzFolder inner;
+      UInt64 innerPackPos[2];
+      COzDecMemStream memStream;
+      UInt32 i;
+      memset(&inner, 0, sizeof(inner));
+      inner.NumCoders = folder->NumCoders - 1;
+      for (i = 0; i < inner.NumCoders; i++)
+        inner.Coders[i] = folder->Coders[i + 1];
+      inner.NumBonds = folder->NumBonds - 1;
+      for (i = 0; i < inner.NumBonds; i++)
+      {
+        inner.Bonds[i].InIndex = folder->Bonds[i + 1].InIndex - 1;
+        inner.Bonds[i].OutIndex = folder->Bonds[i + 1].OutIndex - 1;
+      }
+      inner.NumPackStreams = 1;
+      inner.PackStreams[0] = 0;
+      inner.UnpackStream = folder->UnpackStream > 0 ? folder->UnpackStream - 1 : 0;
+      innerPackPos[0] = 0;
+      innerPackPos[1] = decSize64;
+      memStream.vt.Look = OzDecMem_Look;
+      memStream.vt.Skip = OzDecMem_Skip;
+      memStream.vt.Read = OzDecMem_Read;
+      memStream.vt.Seek = OzDecMem_Seek;
+      memStream.data = aesBuf;
+      memStream.size = (size_t)decSize64;
+      memStream.pos = 0;
+      res = SzFolder_Decode2(&inner, propsData, unpackSizes + 1, innerPackPos,
+          &memStream.vt, 0, outBuffer, outSize, allocMain, tempBuf);
+    }
+    ISzAlloc_Free(allocMain, aesBuf);
+    return res;
+  }
 
   RINOK(CheckSupportedFolder(folder))
 

@@ -4,7 +4,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-macOS_%7C_Linux_%7C_Windows-informational.svg)](#installation)
 [![License](https://img.shields.io/badge/license-Open_Source-brightgreen.svg)](#)
 
-**OpenZip** (`openzip`) is a fast, free, cross-platform file archiver written in Rust with hardware SIMD-accelerated compression (`LZMA2`, `BCJ`, `Delta`, and hardware `CRC-32` / `SHA-256`). It creates and extracts standard `.7z` archives on **Windows**, **macOS**, and **Linux** (both **ARM64** and **x86_64**).
+**OpenZip** (`openzip`) is a fast, free, cross-platform file archiver written in Rust with hardware SIMD-accelerated compression (`LZMA2`, `DEFLATE`, `BCJ`, `Delta`, and hardware `CRC-32` / `SHA-256`). It creates, verifies, lists, and extracts standard **`.7z`**, **`.zip`**, **`.tar.gz`** / **`.tgz`**, **`.tar`**, and **`.gz`** archives—including **password-protected `.7z` (`AES-256` + `SHA-256`, including encrypted headers)** and **password-protected `.zip` (`WinZip AES-128/192/256` & `ZipCrypto`)**—on **Windows**, **macOS**, and **Linux** (both **ARM64** and **x86_64**).
 
 ---
 
@@ -63,17 +63,22 @@ cargo install --path .
 ## Quick Usage
 
 ```bash
-# Compress files or folders into an archive
+# Compress files or folders into .7z, .zip, .tar.gz, .tar, or .gz
 openzip a archive.7z folder/ file1.txt
+openzip a archive.zip folder/ file1.txt
+openzip a archive.tar.gz folder/ file1.txt
 
-# Extract an archive (preserving directory structure)
+# Create password-protected archives (AES-256 for .7z and WinZip AES-256 / ZipCrypto for .zip)
+openzip a -pMySecretPassword secure.7z folder/
+openzip a -pMySecretPassword secure.zip folder/
+
+# Extract any supported archive (preserving directory structure)
 openzip x archive.7z -oextracted_folder
+openzip x -pMySecretPassword secure.zip -oextracted_folder
 
-# List contents of an archive
+# List or verify archive contents
 openzip l archive.7z
-
-# Verify archive integrity
-openzip t archive.7z
+openzip t -pMySecretPassword secure.7z
 
 # Run built-in speed benchmark
 openzip bench
