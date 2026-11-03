@@ -1,0 +1,11 @@
+[target.x86_64-pc-windows-gnullvm]
+linker = "/Users/bshea/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"
+
+[target.x86_64-pc-windows-gnu]
+linker = "/Users/bshea/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "/Users/bshea/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "/Users/bshea/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld"

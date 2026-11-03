@@ -1,0 +1,12 @@
+[package]
+name = "openzip"
+version = "1.0.0"
+edition = "2021"
+description = "OpenZip: High-performance cross-platform Rust hybrid archiver and SIMD compression engine"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = false
