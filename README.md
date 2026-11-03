@@ -30,7 +30,8 @@ Live-benchmarked on a **58.61 MiB** mixed corpus (C/Rust source code, native ARM
 Pre-built installers and binaries for all platforms are available on the [**Releases**](https://github.com/bshea-1/OpenZip/releases/tag/v1.0.0) page:
 
 ### macOS (Apple Silicon & Intel)
-- **Installer Package (`.pkg`)**: Download and run [**`OpenZip-1.0.0-macos-universal.pkg`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/OpenZip-1.0.0-macos-universal.pkg)
+- **Disk Image (`.dmg` — Drag & Drop to Applications)**: [**`OpenZip-1.0.0-macos.dmg`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/OpenZip-1.0.0-macos.dmg)
+- **Installer Package (`.pkg` — Installs `/Applications/OpenZip.app` + CLI)**: [**`OpenZip-1.0.0-macos-universal.pkg`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/OpenZip-1.0.0-macos-universal.pkg)
 - **One-Line Terminal Install**:
   ```bash
   curl -fsSL https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/install.sh | sh
