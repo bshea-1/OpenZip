@@ -1,6 +1,6 @@
 # OpenZip
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/bshea-1/OpenZip/releases/tag/v1.0.0)
 [![Platforms](https://img.shields.io/badge/platforms-macOS_%7C_Linux_%7C_Windows-informational.svg)](#installation)
 [![License](https://img.shields.io/badge/license-Open_Source-brightgreen.svg)](#)
 
@@ -27,11 +27,29 @@ Live-benchmarked on a **58.61 MiB** mixed corpus (C/Rust source code, native ARM
 
 ## Installation
 
-### Prerequisites
-- [Rust Toolchain](https://rustup.rs/) (`cargo` and `rustc`)
-- A C compiler (`clang` on macOS/Linux, `cl.exe` or `clang` on Windows)
+Pre-built installers and binaries for all platforms are available on the [**Releases**](https://github.com/bshea-1/OpenZip/releases/tag/v1.0.0) page:
 
-### Build & Install from Source
+### macOS (Apple Silicon & Intel)
+- **Installer Package (`.pkg`)**: Download and run [**`OpenZip-1.0.0-macos-universal.pkg`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/OpenZip-1.0.0-macos-universal.pkg)
+- **One-Line Terminal Install**:
+  ```bash
+  curl -fsSL https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/install.sh | sh
+  ```
+
+### Windows (`x86_64`)
+- **Setup Installer (`.exe`)**: Download and run [**`OpenZip-1.0.0-windows-x86_64-setup.exe`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/OpenZip-1.0.0-windows-x86_64-setup.exe)
+- **Portable ZIP**: Download [**`openzip-v1.0.0-windows-x86_64.zip`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/openzip-v1.0.0-windows-x86_64.zip) (includes `openzip.exe` and `install.ps1`)
+
+### Linux (`x86_64` & `ARM64`)
+- **Debian / Ubuntu (`.deb`)**:
+  - `x86_64`: [**`openzip_1.0.0_amd64.deb`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/openzip_1.0.0_amd64.deb) (`sudo dpkg -i openzip_1.0.0_amd64.deb`)
+  - `ARM64`: [**`openzip_1.0.0_arm64.deb`**](https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/openzip_1.0.0_arm64.deb) (`sudo dpkg -i openzip_1.0.0_arm64.deb`)
+- **One-Line Terminal Install (Static MUSL Binary)**:
+  ```bash
+  curl -fsSL https://github.com/bshea-1/OpenZip/releases/download/v1.0.0/install.sh | sh
+  ```
+
+### Build from Source
 
 ```bash
 git clone https://github.com/bshea-1/OpenZip.git
@@ -39,13 +57,9 @@ cd OpenZip
 cargo install --path .
 ```
 
-Or build the standalone release binary directly in `./target/release/openzip`:
+---
 
-```bash
-cargo build --release
-```
-
-### Quick Usage
+## Quick Usage
 
 ```bash
 # Compress files or folders into an archive
